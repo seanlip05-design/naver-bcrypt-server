@@ -46,22 +46,35 @@ app.post("/naver-token", async (req, res) => {
   }
 });
 
-// [신규 추가] 데이일 4대장(M, N, O, P) 데이터 자동 집계 엔진 (환불액 독립 추출)
+// [수정 완료] 데이일 4대장 데이터 자동 집계 엔진 (날짜 인코딩 + 클레임 검색 수정)
 app.post('/naver-daily-summary', async (req, res) => {
   try {
     const { access_token, target_date } = req.body;
-    const start = `${target_date}T00:00:00.000+09:00`;
-    const end = `${target_date}T23:59:59.999+09:00`;
-
+    
+    // 1단계: 네이버 API가 날짜를 인식할 수 있도록 안전하게 인코딩 (URLSearchParams 사용)
     const fetchIds = async (status) => {
-      const url = `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/last-changed-statuses?lastChangedFrom=${start}&lastChangedTo=${end}&lastChangedType=${status}`;
+      const params = new URLSearchParams({
+        lastChangedFrom: `${target_date}T00:00:00.000+09:00`,
+        lastChangedTo: `${target_date}T23:59:59.999+09:00`,
+        lastChangedType: status
+      });
+      const url = `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/last-changed-statuses?${params.toString()}`;
+      
       const response = await fetch(url, { headers: { 'Authorization': `Bearer ${access_token}` } });
       const data = await response.json();
       return data.data && data.data.lastChangeStatuses ? data.data.lastChangeStatuses.map(item => item.productOrderId) : [];
     };
 
+    // 2단계: 어제 '결제완료'된 건과 '취소/반품 완료'된 건의 주문번호 싹쓸이
+    const payedIds = await fetchIds('PAYED'); 
+    const claimIds = await fetchIds('CLAIM_COMPLETED'); // CANCELED 대신 이게 정답입니다.
+    
+    const allIds = [...new Set([...payedIds, ...claimIds])];
+
+    // 3단계: 긁어온 주문번호로 실제 금액 뜯어보기
     const fetchDetails = async (ids) => {
       if (!ids || ids.length === 0) return { totalPay: 0, totalCancel: 0, totalReturn: 0, totalRefund: 0 };
+      
       const url = `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/query`;
       const response = await fetch(url, {
         method: 'POST',
@@ -75,26 +88,37 @@ app.post('/naver-daily-summary', async (req, res) => {
       if (data.data && Array.isArray(data.data)) {
         data.data.forEach(order => {
           const po = order.productOrder || {};
-          const claim = order.claim || {};
+          const id = po.productOrderId;
+          const amt = po.totalPaymentAmount || 0;
           
-          totalPay += (po.totalPaymentAmount || 0); // M열: 결제금액
-          if (po.productOrderStatus === 'CANCELED') totalCancel += (po.totalPaymentAmount || 0); // N열: 스토어취소
-          if (po.productOrderStatus === 'RETURNED') totalReturn += (po.totalPaymentAmount || 0); // O열: 스토어반품
+          // M열: 어제 결제된 건이면 매출액에 더하기
+          if (payedIds.includes(id)) {
+            totalPay += amt;
+          }
           
-          // P열: 클레임 정보에서 찐 환불금액만 독립적으로 추출
-          if (claim.refundInfo && claim.refundInfo.refundAmount) {
-             totalRefund += claim.refundInfo.refundAmount; 
+          // N, O, P열: 어제 취소/반품 완료된 건이면 분류해서 더하기
+          if (claimIds.includes(id)) {
+            if (po.claimType === 'CANCEL' || po.claimType === 'ADMIN_CANCEL') {
+              totalCancel += amt; // N열 (스토어취소)
+            } else if (po.claimType === 'RETURN') {
+              totalReturn += amt; // O열 (스토어반품)
+            }
+            
+            // P열 (찐 환불금액 찾기)
+            let exactRefund = 0;
+            if (order.completedClaims && order.completedClaims.length > 0) {
+               order.completedClaims.forEach(c => {
+                   exactRefund += (c.refundAmount || c.totalRefundAmount || 0);
+               });
+            }
+            // 환불내역을 못 찾았다면 취소된 원래 상품금액으로 대체
+            totalRefund += (exactRefund > 0 ? exactRefund : amt);
           }
         });
       }
       return { totalPay, totalCancel, totalReturn, totalRefund };
     };
 
-    const payedIds = await fetchIds('PAYED');
-    const canceledIds = await fetchIds('CANCELED');
-    const returnedIds = await fetchIds('RETURNED');
-    
-    const allIds = [...new Set([...payedIds, ...canceledIds, ...returnedIds])];
     const results = await fetchDetails(allIds);
 
     res.json({
