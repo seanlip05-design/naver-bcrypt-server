@@ -46,15 +46,24 @@ app.post("/naver-token", async (req, res) => {
   }
 });
 
-// [결제금액 누락 완벽 해결] 데이일 4대장 집계 엔진
+// [결제누락/IP마지막기회 완벽대비] 데이일 4대장 집계 엔진
 app.post('/naver-daily-summary', async (req, res) => {
   try {
     const { access_token, target_date } = req.body;
     
-    // 1단계: '상태' 따지지 말고, 어제 털끝 하나라도 변경된 주문 내역 싹 다 가져오기
+    // 타겟 날짜의 다음날(오늘) 계산
+    const [y, m, d] = target_date.split('-');
+    const tDate = new Date(y, m - 1, d);
+    tDate.setDate(tDate.getDate() + 1);
+    const ny = tDate.getFullYear();
+    const nm = String(tDate.getMonth() + 1).padStart(2, '0');
+    const nd = String(tDate.getDate()).padStart(2, '0');
+    const nextDayStr = `${ny}-${nm}-${nd}`;
+
+    // 1단계: '어제'부터 '오늘 밤'까지 이틀치 넉넉하게 가져오기 (오늘 아침 송장처리 건 누락 방지)
     const params = new URLSearchParams({
       lastChangedFrom: `${target_date}T00:00:00.000+09:00`,
-      lastChangedTo: `${target_date}T23:59:59.999+09:00`
+      lastChangedTo: `${nextDayStr}T23:59:59.999+09:00`
     });
     const url = `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/last-changed-statuses?${params.toString()}`;
     
@@ -69,11 +78,14 @@ app.post('/naver-daily-summary', async (req, res) => {
     const idMap = {};
     const allIds = [];
     statuses.forEach(s => {
-       idMap[s.productOrderId] = s.lastChangedType;
+       idMap[s.productOrderId] = {
+           type: s.lastChangedType,
+           changedDate: s.lastChangedDate 
+       };
        allIds.push(s.productOrderId);
     });
 
-    // 2단계: 모아온 전체 ID로 상세 데이터(영수증) 열어보기
+    // 2단계: 모아온 전체 ID로 영수증 다 까보기
     const detailsUrl = `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/query`;
     const detailsResponse = await fetch(detailsUrl, {
       method: 'POST',
@@ -87,18 +99,18 @@ app.post('/naver-daily-summary', async (req, res) => {
     if (detailsData.data && Array.isArray(detailsData.data)) {
       detailsData.data.forEach(detail => {
         const po = detail.productOrder || {};
-        const ord = detail.order || {};   // ⭐️ 여기가 핵심 (order 보따리에서 꺼내도록 수정)
+        const ord = detail.order || {};
         const id = po.productOrderId;
-        const lastType = idMap[id];
+        const idInfo = idMap[id];
         const amt = po.totalPaymentAmount || 0;
 
-        // [M열] 결제금액: ord(order 보따리)에서 결제 날짜가 '어제(target_date)'인지 정확히 확인!
+        // [M열] 결제금액: 오늘 아침에 배송처리 했든 말든, '결제일'이 어제(target_date)면 100% 더함
         if (ord.paymentDate && ord.paymentDate.startsWith(target_date)) {
           totalPay += amt;
         }
 
-        // [N, O, P열] 취소/반품: (이 부분은 아까 43,000원 완벽하게 맞았으므로 건드리지 않았습니다)
-        if (lastType === 'CLAIM_COMPLETED') {
+        // [N, O, P열] 취소/반품: '클레임 완료일'이 어제(target_date)인 것만 발라내기
+        if (idInfo.type === 'CLAIM_COMPLETED' && idInfo.changedDate && idInfo.changedDate.startsWith(target_date)) {
             if (po.productOrderStatus === 'CANCELED') {
                 totalCancel += amt; 
             } else if (po.productOrderStatus === 'RETURNED') {
