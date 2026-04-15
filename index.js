@@ -46,87 +46,90 @@ app.post("/naver-token", async (req, res) => {
   }
 });
 
-// [수정 완료] 데이일 4대장 데이터 자동 집계 엔진 (날짜 인코딩 + 클레임 검색 수정)
+// [최종 수정 완료] 데이일 4대장 - 누락 방지 완벽 집계 엔진
 app.post('/naver-daily-summary', async (req, res) => {
   try {
     const { access_token, target_date } = req.body;
     
-    // 1단계: 네이버 API가 날짜를 인식할 수 있도록 안전하게 인코딩 (URLSearchParams 사용)
-    const fetchIds = async (status) => {
-      const params = new URLSearchParams({
-        lastChangedFrom: `${target_date}T00:00:00.000+09:00`,
-        lastChangedTo: `${target_date}T23:59:59.999+09:00`,
-        lastChangedType: status
-      });
-      const url = `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/last-changed-statuses?${params.toString()}`;
-      
-      const response = await fetch(url, { headers: { 'Authorization': `Bearer ${access_token}` } });
-      const data = await response.json();
-      return data.data && data.data.lastChangeStatuses ? data.data.lastChangeStatuses.map(item => item.productOrderId) : [];
-    };
-
-    // 2단계: 어제 '결제완료'된 건과 '취소/반품 완료'된 건의 주문번호 싹쓸이
-    const payedIds = await fetchIds('PAYED'); 
-    const claimIds = await fetchIds('CLAIM_COMPLETED'); // CANCELED 대신 이게 정답입니다.
+    // 1단계: '상태' 따지지 말고, 어제 털끝 하나라도 변경된 주문 내역 싹 다 가져오기
+    const params = new URLSearchParams({
+      lastChangedFrom: `${target_date}T00:00:00.000+09:00`,
+      lastChangedTo: `${target_date}T23:59:59.999+09:00`
+    });
+    // lastChangedType을 일부러 뺐습니다. (누락 방지)
+    const url = `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/last-changed-statuses?${params.toString()}`;
     
-    const allIds = [...new Set([...payedIds, ...claimIds])];
+    const response = await fetch(url, { headers: { 'Authorization': `Bearer ${access_token}` } });
+    const data = await response.json();
+    
+    const statuses = data.data && data.data.lastChangeStatuses ? data.data.lastChangeStatuses : [];
+    if (statuses.length === 0) {
+       return res.json({ date: target_date, pay: 0, cancel: 0, return: 0, refund: 0 });
+    }
 
-    // 3단계: 긁어온 주문번호로 실제 금액 뜯어보기
-    const fetchDetails = async (ids) => {
-      if (!ids || ids.length === 0) return { totalPay: 0, totalCancel: 0, totalReturn: 0, totalRefund: 0 };
-      
-      const url = `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/query`;
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${access_token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ productOrderIds: ids })
-      });
-      const data = await response.json();
-      
-      let totalPay = 0, totalCancel = 0, totalReturn = 0, totalRefund = 0;
-      
-      if (data.data && Array.isArray(data.data)) {
-        data.data.forEach(order => {
-          const po = order.productOrder || {};
-          const id = po.productOrderId;
-          const amt = po.totalPaymentAmount || 0;
-          
-          // M열: 어제 결제된 건이면 매출액에 더하기
-          if (payedIds.includes(id)) {
-            totalPay += amt;
-          }
-          
-          // N, O, P열: 어제 취소/반품 완료된 건이면 분류해서 더하기
-          if (claimIds.includes(id)) {
-            if (po.claimType === 'CANCEL' || po.claimType === 'ADMIN_CANCEL') {
-              totalCancel += amt; // N열 (스토어취소)
-            } else if (po.claimType === 'RETURN') {
-              totalReturn += amt; // O열 (스토어반품)
-            }
+    // ID 모으기 + 이 주문이 어제 무슨 일로 변경되었는지 기록
+    const idMap = {};
+    const allIds = [];
+    statuses.forEach(s => {
+       idMap[s.productOrderId] = s.lastChangedType;
+       allIds.push(s.productOrderId);
+    });
+
+    // 2단계: 모아온 전체 ID로 상세 데이터(영수증) 열어보기
+    const detailsUrl = `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/query`;
+    const detailsResponse = await fetch(detailsUrl, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${access_token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ productOrderIds: allIds })
+    });
+    const detailsData = await detailsResponse.json();
+
+    let totalPay = 0, totalCancel = 0, totalReturn = 0, totalRefund = 0;
+
+    if (detailsData.data && Array.isArray(detailsData.data)) {
+      detailsData.data.forEach(order => {
+        const po = order.productOrder || {};
+        const id = po.productOrderId;
+        const lastType = idMap[id]; // 어제 일어난 마지막 이벤트
+        const amt = po.totalPaymentAmount || 0;
+
+        // [M열] 결제금액: 현재 배송중이든 발송처리든 상관없이, 결제 날짜가 '어제(target_date)'면 무조건 더함
+        if (po.paymentDate && po.paymentDate.startsWith(target_date)) {
+          totalPay += amt;
+        }
+
+        // [N, O, P열] 취소/반품: 어제 '클레임이 완전히 끝난(CLAIM_COMPLETED)' 건들만 추려서 분리
+        if (lastType === 'CLAIM_COMPLETED') {
             
-            // P열 (찐 환불금액 찾기)
+            // 취소냐 반품이냐 정확히 가르기
+            if (po.productOrderStatus === 'CANCELED') {
+                totalCancel += amt; // N열 (스토어취소)
+            } else if (po.productOrderStatus === 'RETURNED') {
+                totalReturn += amt; // O열 (스토어반품)
+            } else {
+                // 혹시 모를 직권취소 등 예외 처리
+                if (po.claimType === 'CANCEL' || po.claimType === 'ADMIN_CANCEL') totalCancel += amt;
+                else if (po.claimType === 'RETURN') totalReturn += amt;
+            }
+
+            // P열: 실제 환불된 금액 쥐어짜기
             let exactRefund = 0;
             if (order.completedClaims && order.completedClaims.length > 0) {
-               order.completedClaims.forEach(c => {
-                   exactRefund += (c.refundAmount || c.totalRefundAmount || 0);
-               });
+               order.completedClaims.forEach(c => exactRefund += (c.refundAmount || c.totalRefundAmount || 0));
+            } else if (order.claim && order.claim.refundInfo) {
+               exactRefund += (order.claim.refundInfo.refundAmount || 0);
             }
-            // 환불내역을 못 찾았다면 취소된 원래 상품금액으로 대체
             totalRefund += (exactRefund > 0 ? exactRefund : amt);
-          }
-        });
-      }
-      return { totalPay, totalCancel, totalReturn, totalRefund };
-    };
-
-    const results = await fetchDetails(allIds);
+        }
+      });
+    }
 
     res.json({
       date: target_date,
-      pay: results.totalPay,       
-      cancel: results.totalCancel, 
-      return: results.totalReturn, 
-      refund: results.totalRefund  
+      pay: totalPay,
+      cancel: totalCancel,
+      return: totalReturn,
+      refund: totalRefund
     });
 
   } catch (error) {
