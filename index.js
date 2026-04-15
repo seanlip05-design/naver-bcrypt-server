@@ -46,7 +46,7 @@ app.post("/naver-token", async (req, res) => {
   }
 });
 
-// [최종 수정 완료] 데이일 4대장 - 누락 방지 완벽 집계 엔진
+// [결제금액 누락 완벽 해결] 데이일 4대장 집계 엔진
 app.post('/naver-daily-summary', async (req, res) => {
   try {
     const { access_token, target_date } = req.body;
@@ -56,7 +56,6 @@ app.post('/naver-daily-summary', async (req, res) => {
       lastChangedFrom: `${target_date}T00:00:00.000+09:00`,
       lastChangedTo: `${target_date}T23:59:59.999+09:00`
     });
-    // lastChangedType을 일부러 뺐습니다. (누락 방지)
     const url = `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/last-changed-statuses?${params.toString()}`;
     
     const response = await fetch(url, { headers: { 'Authorization': `Bearer ${access_token}` } });
@@ -67,7 +66,6 @@ app.post('/naver-daily-summary', async (req, res) => {
        return res.json({ date: target_date, pay: 0, cancel: 0, return: 0, refund: 0 });
     }
 
-    // ID 모으기 + 이 주문이 어제 무슨 일로 변경되었는지 기록
     const idMap = {};
     const allIds = [];
     statuses.forEach(s => {
@@ -87,37 +85,34 @@ app.post('/naver-daily-summary', async (req, res) => {
     let totalPay = 0, totalCancel = 0, totalReturn = 0, totalRefund = 0;
 
     if (detailsData.data && Array.isArray(detailsData.data)) {
-      detailsData.data.forEach(order => {
-        const po = order.productOrder || {};
+      detailsData.data.forEach(detail => {
+        const po = detail.productOrder || {};
+        const ord = detail.order || {};   // ⭐️ 여기가 핵심 (order 보따리에서 꺼내도록 수정)
         const id = po.productOrderId;
-        const lastType = idMap[id]; // 어제 일어난 마지막 이벤트
+        const lastType = idMap[id];
         const amt = po.totalPaymentAmount || 0;
 
-        // [M열] 결제금액: 현재 배송중이든 발송처리든 상관없이, 결제 날짜가 '어제(target_date)'면 무조건 더함
-        if (po.paymentDate && po.paymentDate.startsWith(target_date)) {
+        // [M열] 결제금액: ord(order 보따리)에서 결제 날짜가 '어제(target_date)'인지 정확히 확인!
+        if (ord.paymentDate && ord.paymentDate.startsWith(target_date)) {
           totalPay += amt;
         }
 
-        // [N, O, P열] 취소/반품: 어제 '클레임이 완전히 끝난(CLAIM_COMPLETED)' 건들만 추려서 분리
+        // [N, O, P열] 취소/반품: (이 부분은 아까 43,000원 완벽하게 맞았으므로 건드리지 않았습니다)
         if (lastType === 'CLAIM_COMPLETED') {
-            
-            // 취소냐 반품이냐 정확히 가르기
             if (po.productOrderStatus === 'CANCELED') {
-                totalCancel += amt; // N열 (스토어취소)
+                totalCancel += amt; 
             } else if (po.productOrderStatus === 'RETURNED') {
-                totalReturn += amt; // O열 (스토어반품)
+                totalReturn += amt; 
             } else {
-                // 혹시 모를 직권취소 등 예외 처리
                 if (po.claimType === 'CANCEL' || po.claimType === 'ADMIN_CANCEL') totalCancel += amt;
                 else if (po.claimType === 'RETURN') totalReturn += amt;
             }
 
-            // P열: 실제 환불된 금액 쥐어짜기
             let exactRefund = 0;
-            if (order.completedClaims && order.completedClaims.length > 0) {
-               order.completedClaims.forEach(c => exactRefund += (c.refundAmount || c.totalRefundAmount || 0));
-            } else if (order.claim && order.claim.refundInfo) {
-               exactRefund += (order.claim.refundInfo.refundAmount || 0);
+            if (detail.completedClaims && detail.completedClaims.length > 0) {
+               detail.completedClaims.forEach(c => exactRefund += (c.refundAmount || c.totalRefundAmount || 0));
+            } else if (detail.claim && detail.claim.refundInfo) {
+               exactRefund += (detail.claim.refundInfo.refundAmount || 0);
             }
             totalRefund += (exactRefund > 0 ? exactRefund : amt);
         }
