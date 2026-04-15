@@ -50,3 +50,10 @@ const port = process.env.PORT || 10000;
 app.listen(port, () => {
   console.log(`Server running on ${port}`);
 });
+
+// 서버의 진짜 IP를 확인하기 위한 비밀 통로
+app.get("/myip", async (req, res) => {
+  const ipRes = await fetch("https://api.ipify.org");
+  const ip = await ipRes.text();
+  res.send("현재 Render 서버의 출입증(IP) 번호: " + ip);
+});
