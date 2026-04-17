@@ -51,22 +51,30 @@ app.post('/naver-daily-summary', async (req, res) => {
   try {
     const { access_token, target_date } = req.body;
     
-    // 1단계: 14일부터 15일까지 넉넉하게 검색 (누락 방지)
+    // 1단계: 검색 누락 방지를 위해 검색 종료일을 target_date 기준 +3일로 넉넉하게 자동 설정
+    const startDate = new Date(target_date);
+    const endDate = new Date(startDate);
+    endDate.setDate(startDate.getDate() + 3);
+    const endDateStr = endDate.toISOString().split('T')[0];
+
     const params = new URLSearchParams({
       lastChangedFrom: `${target_date}T00:00:00.000+09:00`,
-      lastChangedTo: `2026-04-16T00:00:00.000+09:00` 
+      lastChangedTo: `${endDateStr}T23:59:59.999+09:00`
     });
+
     const url = `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/last-changed-statuses?${params.toString()}`;
-    
     const response = await fetch(url, { headers: { 'Authorization': `Bearer ${access_token}` } });
     const data = await response.json();
-    const statuses = data.data && data.data.lastChangeStatuses ? data.data.lastChangeStatuses : [];
+    const statuses = data.data?.lastChangeStatuses || [];
 
-    if (statuses.length === 0) return res.json({ date: target_date, pay: 0, cancel: 0, return: 0, refund: 0 });
+    if (statuses.length === 0) {
+        return res.json({ date: target_date, pay: 0, cancel: 0, return: 0, refund: 0 });
+    }
 
+    // 중복 제거하여 주문 ID 싹쓸이
     const allIds = [...new Set(statuses.map(s => s.productOrderId))];
 
-    // 2단계: 상세 데이터 조회
+    // 2단계: 모은 ID로 영수증 상세 데이터 한 번에 까보기
     const detailsResponse = await fetch(`https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/query`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${access_token}`, 'Content-Type': 'application/json' },
@@ -80,30 +88,45 @@ app.post('/naver-daily-summary', async (req, res) => {
       detailsData.data.forEach(item => {
         const po = item.productOrder || {};
         const ord = item.order || {};
+        const clm = item.claim || {};
         const amt = po.totalPaymentAmount || 0;
 
-        // [핵심] 결제일이 '2026-04-14'로 시작하면 무조건 더함 (777,300원 타겟)
-        if (ord.paymentDate && ord.paymentDate.startsWith(target_date)) {
+        // [M열 매출] 결제일시가 정확히 "2026-04-14..." 로 시작하면 무조건 더함 (777,300원 타겟)
+        const payDate = ord.paymentDate || '';
+        if (payDate.startsWith(target_date)) {
           paySum += amt;
         }
 
-        // [취소/반품] 상태가 CANCELED/RETURNED이면서 변경일이 14일인 것만
-        const changedDate = statuses.find(s => s.productOrderId === po.productOrderId)?.lastChangedDate;
-        if (changedDate && changedDate.startsWith(target_date)) {
-          if (po.productOrderStatus === 'CANCELED') cancelSum += amt;
-          else if (po.productOrderStatus === 'RETURNED') returnSum += amt;
+        // [N, O, P열 취소/환불] 클레임 완료일 또는 환불일이 "2026-04-14..." 로 시작하면 무조건 더함 (43,000원 타겟)
+        let claimDate = '';
+        if (po.claimType === 'CANCEL' || po.claimType === 'ADMIN_CANCEL') {
+            claimDate = clm.cancelCompletionDate || '';
+        } else if (po.claimType === 'RETURN') {
+            claimDate = clm.returnCompletionDate || '';
+        }
+        
+        const refundDate = clm.refundInfo?.refundDate || '';
+
+        // 클레임이 완료되었거나 환불된 날짜가 14일인 경우
+        if (claimDate.startsWith(target_date) || refundDate.startsWith(target_date)) {
           
-          // 환불액 계산 (43,000원 타겟)
-          let rf = 0;
-          if (item.completedClaims) item.completedClaims.forEach(c => rf += (c.refundAmount || 0));
-          else if (item.claim?.refundInfo) rf = item.claim.refundInfo.refundAmount || 0;
-          refundSum += (rf > 0 ? rf : (po.productOrderStatus === 'CANCELED' ? amt : 0));
+          if (po.claimType === 'CANCEL' || po.claimType === 'ADMIN_CANCEL') {
+              cancelSum += amt;
+          } else if (po.claimType === 'RETURN') {
+              returnSum += amt;
+          }
+
+          // P열 환불금액 추출
+          let exactRefund = clm.refundInfo?.refundAmount || 0;
+          // 환불액이 명시되어 있으면 그 금액을, 아니면 상품금액 전체를 환불액으로 처리
+          refundSum += (exactRefund > 0 ? exactRefund : amt);
         }
       });
     }
 
     res.json({ date: target_date, pay: paySum, cancel: cancelSum, return: returnSum, refund: refundSum });
   } catch (e) {
+    console.error("서버 에러:", e);
     res.status(500).json({ error: e.message });
   }
 });
