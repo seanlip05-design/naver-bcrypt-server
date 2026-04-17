@@ -47,82 +47,234 @@ app.post("/naver-token", async (req, res) => {
 });
 
 // [결제누락/IP마지막기회 완벽대비] 데이일 4대장 집계 엔진
+// [최종 수정본] 데이일 4대장 집계 엔진
 app.post('/naver-daily-summary', async (req, res) => {
   try {
     const { access_token, target_date } = req.body;
-    
-    // 1단계: 결제일 누락을 막기 위해 검색 범위를 '타겟일'부터 '현재 시점(+7일 여유)'까지 초대형으로 넓힘
-    const startDate = new Date(target_date);
-    const endDate = new Date(startDate);
-    endDate.setDate(startDate.getDate() + 7);
-    const endDateStr = endDate.toISOString().split('T')[0];
 
-    const params = new URLSearchParams({
-      lastChangedFrom: `${target_date}T00:00:00.000+09:00`,
-      lastChangedTo: `${endDateStr}T23:59:59.999+09:00`
-    });
-
-    const url = `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/last-changed-statuses?${params.toString()}`;
-    const response = await fetch(url, { headers: { 'Authorization': `Bearer ${access_token}` } });
-    const data = await response.json();
-
-    // 네이버 에러 발생 시 숨기지 않고 즉시 반환
-    if (data.code || data.error) {
-        return res.status(400).json({ error: "네이버 차단/에러 발생", detail: data });
+    if (!access_token || !target_date) {
+      return res.status(400).json({ error: 'access_token / target_date 필요' });
     }
 
-    const statuses = data.data?.lastChangeStatuses || [];
-    if (statuses.length === 0) {
-        return res.json({ date: target_date, pay: 0, cancel: 0, return: 0, refund: 0 });
-    }
+    const authHeaders = {
+      'Authorization': `Bearer ${access_token}`,
+      'Content-Type': 'application/json'
+    };
 
-    const allIds = [...new Set(statuses.map(s => s.productOrderId))];
+    // 1) 변경 주문 전체 페이지 수집
+    const changedStatuses = await fetchAllChangedStatuses_(access_token, target_date);
 
-    // 2단계: 상세 영수증 조회
-    const detailsResponse = await fetch(`https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/query`, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${access_token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ productOrderIds: allIds })
-    });
-    const detailsData = await detailsResponse.json();
-
-    let paySum = 0, cancelSum = 0, returnSum = 0, refundSum = 0;
-
-    if (detailsData.data) {
-      detailsData.data.forEach(item => {
-        const po = item.productOrder || {};
-        const ord = item.order || {};
-        const clm = item.claim || {};
-        const amt = po.totalPaymentAmount || 0;
-
-        // ⭐️ [판매성과 데이터] - 결제금액은 오직 '결제일(paymentDate)'만 보고 독립적으로 계산 (1,305,000원 타겟)
-        const payDate = ord.paymentDate || '';
-        if (payDate.startsWith(target_date)) {
-          paySum += amt;
-        }
-
-        // ⭐️ [클레임 데이터] - 취소/반품/환불은 오직 '클레임 완료일'만 보고 계산 (기존 완벽 로직)
-        let claimDate = '';
-        if (po.claimType === 'CANCEL' || po.claimType === 'ADMIN_CANCEL') claimDate = clm.cancelCompletionDate || '';
-        else if (po.claimType === 'RETURN') claimDate = clm.returnCompletionDate || '';
-        
-        const refundDate = clm.refundInfo?.refundDate || '';
-
-        if (claimDate.startsWith(target_date) || refundDate.startsWith(target_date)) {
-          if (po.claimType === 'CANCEL' || po.claimType === 'ADMIN_CANCEL') cancelSum += amt;
-          else if (po.claimType === 'RETURN') returnSum += amt;
-
-          let exactRefund = clm.refundInfo?.refundAmount || 0;
-          refundSum += (exactRefund > 0 ? exactRefund : amt);
-        }
+    if (changedStatuses.length === 0) {
+      return res.json({
+        date: target_date,
+        pay: 0,
+        cancel: 0,
+        return: 0,
+        refund: 0
       });
     }
 
-    res.json({ date: target_date, pay: paySum, cancel: cancelSum, return: returnSum, refund: refundSum });
+    // 2) 상세 조회용 전체 ID / 결제금액용 ID 분리
+    const latestById = new Map(); // productOrderId -> status
+    const payIds = new Set();
+
+    for (const s of changedStatuses) {
+      const id = s.productOrderId;
+      if (!id) continue;
+
+      latestById.set(id, s);
+
+      // 결제일이 target_date면 결제금액 집계 대상으로 넣음
+      // paymentDate는 변경 상품 주문 구조체에 포함됨
+      if (s.paymentDate && String(s.paymentDate).startsWith(target_date)) {
+        payIds.add(id);
+      }
+    }
+
+    const allIds = [...latestById.keys()];
+    const detailMap = await fetchProductOrderDetailsMap_(authHeaders, allIds);
+
+    let totalPay = 0;
+    let totalCancel = 0;
+    let totalReturn = 0;
+    let totalRefund = 0;
+
+    // 3) 결제금액 계산
+    for (const id of payIds) {
+      const detail = detailMap.get(id);
+      if (!detail) continue;
+
+      const po = detail.productOrder || {};
+      const ord = detail.order || {};
+
+      // 우선순위: 상품주문 결제금액 -> 주문 결제금액 파생값
+      const amt =
+        toSafeNumber_(po.totalPaymentAmount) ||
+        toSafeNumber_(po.totalAmount) ||
+        toSafeNumber_(ord.generalPaymentAmount) +
+          toSafeNumber_(ord.chargeAmountPaymentAmount) +
+          toSafeNumber_(ord.checkoutAccumulationPaymentAmount) +
+          toSafeNumber_(ord.naverMileagePaymentAmount) +
+          toSafeNumber_(ord.payLaterPaymentAmount);
+
+      totalPay += amt;
+    }
+
+    // 4) 취소 / 반품 / 환불 계산
+    for (const [id, s] of latestById.entries()) {
+      const detail = detailMap.get(id);
+      if (!detail) continue;
+
+      const po = detail.productOrder || {};
+      const amt = toSafeNumber_(po.totalPaymentAmount) || toSafeNumber_(po.totalAmount);
+
+      // 클레임 완료건만 취소/반품/환불로 집계
+      if (s.lastChangedType === 'CLAIM_COMPLETED') {
+        const claimType = po.claimType || s.claimType || '';
+        const claimStatus = po.claimStatus || s.claimStatus || '';
+        const poStatus = po.productOrderStatus || s.productOrderStatus || '';
+
+        const isCancel =
+          poStatus === 'CANCELED' ||
+          claimType === 'CANCEL' ||
+          claimType === 'ADMIN_CANCEL' ||
+          claimStatus === 'CANCEL_DONE' ||
+          claimStatus === 'ADMIN_CANCEL_DONE';
+
+        const isReturn =
+          poStatus === 'RETURNED' ||
+          claimType === 'RETURN' ||
+          claimStatus === 'RETURN_DONE';
+
+        if (isCancel) totalCancel += amt;
+        if (isReturn) totalReturn += amt;
+
+        // 환불금액 우선순위
+        let exactRefund = 0;
+
+        if (Array.isArray(detail.completedClaims) && detail.completedClaims.length > 0) {
+          for (const c of detail.completedClaims) {
+            exactRefund +=
+              toSafeNumber_(c.refundAmount) ||
+              toSafeNumber_(c.totalRefundAmount) ||
+              0;
+          }
+        }
+
+        if (!exactRefund && detail.claim && detail.claim.refundInfo) {
+          exactRefund += toSafeNumber_(detail.claim.refundInfo.refundAmount);
+        }
+
+        if (!exactRefund && detail.currentClaim && detail.currentClaim.cancel) {
+          exactRefund += toSafeNumber_(detail.currentClaim.cancel.refundExpectedAmount);
+        }
+
+        if (!exactRefund && detail.currentClaim && detail.currentClaim.return) {
+          exactRefund += toSafeNumber_(detail.currentClaim.return.refundExpectedAmount);
+        }
+
+        totalRefund += exactRefund > 0 ? exactRefund : amt;
+      }
+    }
+
+    return res.json({
+      date: target_date,
+      pay: totalPay,
+      cancel: totalCancel,
+      return: totalReturn,
+      refund: totalRefund
+    });
   } catch (error) {
-    res.status(500).json({ error: "서버 내부 에러", detail: error.message });
+    console.error('집계 에러:', error);
+    return res.status(500).json({
+      error: '데이터 집계 실패',
+      detail: String(error)
+    });
   }
 });
+
+async function fetchAllChangedStatuses_(access_token, target_date) {
+  const all = [];
+  let currentFrom = `${target_date}T00:00:00.000+09:00`;
+  const fixedTo = `${target_date}T23:59:59.999+09:00`;
+  let moreSequence = '';
+
+  while (true) {
+    const params = new URLSearchParams({
+      lastChangedFrom: currentFrom,
+      lastChangedTo: fixedTo
+    });
+
+    if (moreSequence) {
+      params.set('moreSequence', String(moreSequence));
+    }
+
+    const url =
+      `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/last-changed-statuses?${params.toString()}`;
+
+    const response = await fetch(url, {
+      headers: {
+        'Authorization': `Bearer ${access_token}`
+      }
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`변경 주문 조회 실패: ${response.status} ${text}`);
+    }
+
+    const json = await response.json();
+    const list = json?.data?.lastChangeStatuses || [];
+    const more = json?.data?.more || null;
+
+    all.push(...list);
+
+    if (!more || !more.moreFrom) break;
+
+    currentFrom = more.moreFrom;
+    moreSequence = more.moreSequence || '';
+  }
+
+  return all;
+}
+
+async function fetchProductOrderDetailsMap_(authHeaders, productOrderIds) {
+  const map = new Map();
+  const chunkSize = 300;
+
+  for (let i = 0; i < productOrderIds.length; i += chunkSize) {
+    const chunk = productOrderIds.slice(i, i + chunkSize);
+
+    const response = await fetch(
+      'https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/query',
+      {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({ productOrderIds: chunk })
+      }
+    );
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`상세 조회 실패: ${response.status} ${text}`);
+    }
+
+    const json = await response.json();
+    const rows = Array.isArray(json?.data) ? json.data : [];
+
+    for (const row of rows) {
+      const id = row?.productOrder?.productOrderId;
+      if (id) map.set(id, row);
+    }
+  }
+
+  return map;
+}
+
+function toSafeNumber_(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
 
 const port = process.env.PORT || 10000;
 app.listen(port, () => {
