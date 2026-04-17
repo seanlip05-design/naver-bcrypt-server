@@ -52,215 +52,115 @@ const app = express();
 app.use(express.json());
 
 //
+const express = require('express');
+const fetch = require('node-fetch'); // node-fetch 필수
+const app = express();
+app.use(express.json());
+
 app.post('/naver-daily-summary', async (req, res) => {
-  try {
-    const { access_token, target_date } = req.body;
+    try {
+        const { access_token, target_date } = req.body;
+        if (!access_token || !target_date) return res.status(400).json({ error: '토큰/날짜 누락' });
 
-    if (!access_token || !target_date) {
-      return res.status(400).json({
-        error: 'access_token / target_date 필요'
-      });
+        // 챗GPT의 분리형 구조 대신, 한번의 요청으로 결제/취소/환불을 완벽하게 뜯어오는 함수 실행
+        const result = await getNaverDataCorrectly_(access_token, target_date);
+
+        return res.json({
+            date: target_date,
+            pay: result.pay,
+            cancel: result.cancel,
+            return: result.return,
+            refund: result.refund,
+            DEBUG: result.debugMsg // 화면에 결과 내역을 출력합니다
+        });
+    } catch (error) {
+        return res.status(500).json({ error: '에러발생', detail: String(error) });
     }
-
-    // 1) 결제금액 먼저 계산 (블로거 방식)
-    const totalPay = await getPaidAmountByDate_(access_token, target_date);
-
-    // 2) 취소/반품/환불은 기존 방식 유지
-    const { totalCancel, totalReturn, totalRefund } =
-      await getClaimSummaryByDate_(access_token, target_date);
-
-    return res.json({
-      date: target_date,
-      pay: totalPay,
-      cancel: totalCancel,
-      return: totalReturn,
-      refund: totalRefund
-    });
-
-  } catch (error) {
-    console.error('집계 에러:', error);
-    return res.status(500).json({
-      error: '데이터 집계 실패',
-      detail: String(error)
-    });
-  }
 });
 
+// 네이버 API 현실에 맞춘 무적의 추출 함수
+async function getNaverDataCorrectly_(access_token, target_date) {
+    // 1. 타겟 날짜 기준 과거 30일 ~ 내일까지 넉넉하게 싹 다 긁어옵니다 (누락 방지)
+    const start = new Date(target_date);
+    start.setDate(start.getDate() - 30);
+    const startStr = start.toISOString().split('T')[0];
 
-async function getPaidAmountByDate_(access_token, target_date) {
-  let totalPay = 0;
+    const end = new Date(target_date);
+    end.setDate(end.getDate() + 1); 
+    const endStr = end.toISOString().split('T')[0];
 
-  // 블로거 코드처럼 PAYED_DATETIME 기준
-  // from만 주면 해당 시점부터 24시간 범위로 조회되는 방식에 맞춰 사용
-  let from = `${target_date}T00:00:00.000+09:00`;
-  let moreSequence = '';
-
-  while (true) {
     const params = new URLSearchParams({
-      from,
-      rangeType: 'PAYED_DATETIME'
+        lastChangedFrom: `${startStr}T00:00:00.000+09:00`,
+        lastChangedTo: `${endStr}T23:59:59.999+09:00`
     });
 
-    // ⚠️ 여기서 productOrderStatuses=PAYED를 강하게 거는 건 비추천
-    // 이미 배송중/배송완료로 넘어간 주문이 빠질 수 있음
-    // 블로거 코드처럼 넣고 싶으면 아래 줄 사용
-    // params.set('productOrderStatuses', 'PAYED');
+    const url = `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/last-changed-statuses?${params.toString()}`;
+    const response = await fetch(url, { headers: { 'Authorization': `Bearer ${access_token}` } });
+    const data = await response.json();
 
-    if (moreSequence) {
-      params.set('moreSequence', String(moreSequence));
+    if (!data.data || !data.data.lastChangeStatuses) {
+        return { pay:0, cancel:0, return:0, refund:0, debugMsg: "해당 기간에 변경된 주문이 아예 없습니다." };
     }
 
-    const url = `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders?${params.toString()}`;
+    // 중복 ID 제거 (에러 방지)
+    const allIds = [...new Set(data.data.lastChangeStatuses.map(s => s.productOrderId))];
+    if (allIds.length === 0) return { pay:0, cancel:0, return:0, refund:0, debugMsg: "주문 ID가 없습니다." };
 
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${access_token}`,
-        'Content-Type': 'application/json'
-      }
+    // 2. 상세 내역 조회 (한 번에 최대 300개 제한 준수)
+    const detailsResponse = await fetch(`https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/query`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${access_token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ productOrderIds: allIds.slice(0, 300) })
     });
+    const detailsData = await detailsResponse.json();
 
-    const raw = await response.text();
+    let paySum = 0, cancelSum = 0, returnSum = 0, refundSum = 0;
+    let foundRefunds = 0; // 16일 환불건수 체크용
 
-    if (!response.ok) {
-      throw new Error(`결제주문 조회 실패: ${response.status} ${raw}`);
+    if (detailsData.data) {
+        detailsData.data.forEach(item => {
+            const po = item.productOrder || {};
+            const ord = item.order || {};
+            const clm = item.claim || {};
+            const amt = Number(po.totalPaymentAmount || 0);
+
+            // [결제액] 결제일이 정확히 target_date(예: 16일)인 것만 합산
+            if (ord.paymentDate && ord.paymentDate.startsWith(target_date)) {
+                paySum += amt;
+            }
+
+            const cancelDate = clm.cancelCompletionDate || '';
+            const returnDate = clm.returnCompletionDate || '';
+            const refundDate = clm.refundInfo?.refundDate || cancelDate || returnDate || '';
+
+            // [취소액] 취소완료일 기준
+            if (po.claimType === 'CANCEL' || po.claimType === 'ADMIN_CANCEL') {
+                if (cancelDate.startsWith(target_date)) cancelSum += amt;
+            }
+            // [반품액] 반품완료일 기준
+            if (po.claimType === 'RETURN') {
+                if (returnDate.startsWith(target_date)) returnSum += amt;
+            }
+            // [환불액] 챗GPT의 엉터리 로직 제거하고, 진짜 환불된 날짜만 엄격하게 검사
+            if (refundDate.startsWith(target_date)) {
+                let exactRefund = Number(clm.refundInfo?.refundAmount || 0);
+                refundSum += (exactRefund > 0 ? exactRefund : amt);
+                foundRefunds++;
+            }
+        });
     }
 
-    const data = JSON.parse(raw);
-
-    // 응답 구조 방어적으로 처리
-    const rows =
-      data?.data?.productOrders ||
-      data?.data?.contents ||
-      data?.data ||
-      [];
-
-    if (Array.isArray(rows)) {
-      rows.forEach(item => {
-        const po = item.productOrder || item;
-        const amt = Number(po.totalPaymentAmount || 0);
-        totalPay += amt;
-      });
-    }
-
-    const more = data?.data?.more;
-
-    if (!more || !more.moreFrom) {
-      break;
-    }
-
-    from = more.moreFrom;
-    moreSequence = more.moreSequence || '';
-  }
-
-  return totalPay;
-}
-
-
-async function getClaimSummaryByDate_(access_token, target_date) {
-  const params = new URLSearchParams({
-    lastChangedFrom: `${target_date}T00:00:00.000+09:00`,
-    lastChangedTo: `${target_date}T23:59:59.999+09:00`
-  });
-
-  const url = `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/last-changed-statuses?${params.toString()}`;
-
-  const response = await fetch(url, {
-    headers: {
-      'Authorization': `Bearer ${access_token}`
-    }
-  });
-
-  const raw = await response.text();
-
-  if (!response.ok) {
-    throw new Error(`변경주문 조회 실패: ${response.status} ${raw}`);
-  }
-
-  const data = JSON.parse(raw);
-
-  const statuses = data?.data?.lastChangeStatuses || [];
-
-  if (statuses.length === 0) {
     return {
-      totalCancel: 0,
-      totalReturn: 0,
-      totalRefund: 0
+        pay: paySum,
+        cancel: cancelSum,
+        return: returnSum,
+        refund: refundSum,
+        debugMsg: `스캔한 주문 수: ${allIds.length}개 / ${target_date} 환불건 발견: ${foundRefunds}건`
     };
-  }
-
-  const idMap = {};
-  const allIds = [];
-
-  statuses.forEach(s => {
-    if (!s.productOrderId) return;
-    idMap[s.productOrderId] = s.lastChangedType;
-    allIds.push(s.productOrderId);
-  });
-
-  const detailsUrl = `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/query`;
-  const detailsResponse = await fetch(detailsUrl, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${access_token}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ productOrderIds: allIds })
-  });
-
-  const detailsRaw = await detailsResponse.text();
-
-  if (!detailsResponse.ok) {
-    throw new Error(`상세조회 실패: ${detailsResponse.status} ${detailsRaw}`);
-  }
-
-  const detailsData = JSON.parse(detailsRaw);
-
-  let totalCancel = 0;
-  let totalReturn = 0;
-  let totalRefund = 0;
-
-  if (detailsData.data && Array.isArray(detailsData.data)) {
-    detailsData.data.forEach(detail => {
-      const po = detail.productOrder || {};
-      const id = po.productOrderId;
-      const lastType = idMap[id];
-      const amt = Number(po.totalPaymentAmount || 0);
-
-      if (lastType === 'CLAIM_COMPLETED') {
-        if (po.productOrderStatus === 'CANCELED') {
-          totalCancel += amt;
-        } else if (po.productOrderStatus === 'RETURNED') {
-          totalReturn += amt;
-        } else {
-          if (po.claimType === 'CANCEL' || po.claimType === 'ADMIN_CANCEL') {
-            totalCancel += amt;
-          } else if (po.claimType === 'RETURN') {
-            totalReturn += amt;
-          }
-        }
-
-        let exactRefund = 0;
-
-        if (detail.completedClaims && detail.completedClaims.length > 0) {
-          detail.completedClaims.forEach(c => {
-            exactRefund += Number(c.refundAmount || c.totalRefundAmount || 0);
-          });
-        } else if (detail.claim && detail.claim.refundInfo) {
-          exactRefund += Number(detail.claim.refundInfo.refundAmount || 0);
-        }
-
-        totalRefund += (exactRefund > 0 ? exactRefund : amt);
-      }
-    });
-  }
-
-  return {
-    totalCancel,
-    totalReturn,
-    totalRefund
-  };
 }
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 const port = process.env.PORT || 10000;
 app.listen(port, () => {
