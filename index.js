@@ -51,10 +51,10 @@ app.post('/naver-daily-summary', async (req, res) => {
   try {
     const { access_token, target_date } = req.body;
     
-    // 1단계: 검색 누락 방지를 위해 검색 종료일을 target_date 기준 +3일로 넉넉하게 자동 설정
+    // 1단계: 결제일 누락을 막기 위해 검색 범위를 '타겟일'부터 '현재 시점(+7일 여유)'까지 초대형으로 넓힘
     const startDate = new Date(target_date);
     const endDate = new Date(startDate);
-    endDate.setDate(startDate.getDate() + 3);
+    endDate.setDate(startDate.getDate() + 7);
     const endDateStr = endDate.toISOString().split('T')[0];
 
     const params = new URLSearchParams({
@@ -65,16 +65,20 @@ app.post('/naver-daily-summary', async (req, res) => {
     const url = `https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/last-changed-statuses?${params.toString()}`;
     const response = await fetch(url, { headers: { 'Authorization': `Bearer ${access_token}` } });
     const data = await response.json();
-    const statuses = data.data?.lastChangeStatuses || [];
 
+    // 네이버 에러 발생 시 숨기지 않고 즉시 반환
+    if (data.code || data.error) {
+        return res.status(400).json({ error: "네이버 차단/에러 발생", detail: data });
+    }
+
+    const statuses = data.data?.lastChangeStatuses || [];
     if (statuses.length === 0) {
         return res.json({ date: target_date, pay: 0, cancel: 0, return: 0, refund: 0 });
     }
 
-    // 중복 제거하여 주문 ID 싹쓸이
     const allIds = [...new Set(statuses.map(s => s.productOrderId))];
 
-    // 2단계: 모은 ID로 영수증 상세 데이터 한 번에 까보기
+    // 2단계: 상세 영수증 조회
     const detailsResponse = await fetch(`https://api.commerce.naver.com/external/v1/pay-order/seller/product-orders/query`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${access_token}`, 'Content-Type': 'application/json' },
@@ -91,43 +95,32 @@ app.post('/naver-daily-summary', async (req, res) => {
         const clm = item.claim || {};
         const amt = po.totalPaymentAmount || 0;
 
-        // [M열 매출] 결제일시가 정확히 "2026-04-14..." 로 시작하면 무조건 더함 (777,300원 타겟)
+        // ⭐️ [판매성과 데이터] - 결제금액은 오직 '결제일(paymentDate)'만 보고 독립적으로 계산 (1,305,000원 타겟)
         const payDate = ord.paymentDate || '';
         if (payDate.startsWith(target_date)) {
           paySum += amt;
         }
 
-        // [N, O, P열 취소/환불] 클레임 완료일 또는 환불일이 "2026-04-14..." 로 시작하면 무조건 더함 (43,000원 타겟)
+        // ⭐️ [클레임 데이터] - 취소/반품/환불은 오직 '클레임 완료일'만 보고 계산 (기존 완벽 로직)
         let claimDate = '';
-        if (po.claimType === 'CANCEL' || po.claimType === 'ADMIN_CANCEL') {
-            claimDate = clm.cancelCompletionDate || '';
-        } else if (po.claimType === 'RETURN') {
-            claimDate = clm.returnCompletionDate || '';
-        }
+        if (po.claimType === 'CANCEL' || po.claimType === 'ADMIN_CANCEL') claimDate = clm.cancelCompletionDate || '';
+        else if (po.claimType === 'RETURN') claimDate = clm.returnCompletionDate || '';
         
         const refundDate = clm.refundInfo?.refundDate || '';
 
-        // 클레임이 완료되었거나 환불된 날짜가 14일인 경우
         if (claimDate.startsWith(target_date) || refundDate.startsWith(target_date)) {
-          
-          if (po.claimType === 'CANCEL' || po.claimType === 'ADMIN_CANCEL') {
-              cancelSum += amt;
-          } else if (po.claimType === 'RETURN') {
-              returnSum += amt;
-          }
+          if (po.claimType === 'CANCEL' || po.claimType === 'ADMIN_CANCEL') cancelSum += amt;
+          else if (po.claimType === 'RETURN') returnSum += amt;
 
-          // P열 환불금액 추출
           let exactRefund = clm.refundInfo?.refundAmount || 0;
-          // 환불액이 명시되어 있으면 그 금액을, 아니면 상품금액 전체를 환불액으로 처리
           refundSum += (exactRefund > 0 ? exactRefund : amt);
         }
       });
     }
 
     res.json({ date: target_date, pay: paySum, cancel: cancelSum, return: returnSum, refund: refundSum });
-  } catch (e) {
-    console.error("서버 에러:", e);
-    res.status(500).json({ error: e.message });
+  } catch (error) {
+    res.status(500).json({ error: "서버 내부 에러", detail: error.message });
   }
 });
 
